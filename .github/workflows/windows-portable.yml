@@ -45,6 +45,12 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
+      - name: Unit tests
+        run: cargo test --release --locked --lib
+
+      - name: Headless UI tests
+        run: cargo test --release --locked --test ui --test tools
+
       # A release build is a windows_subsystem app, so it has no console of its
       # own; hand it a redirected stdout and check the exit code instead.
       - name: Smoke test (headless)
