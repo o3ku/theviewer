@@ -1,0 +1,5 @@
+# docs/api.md is compared byte for byte with what the code generates (LF line
+# endings), so keep it checked out exactly as stored. Without this, a Windows
+# checkout with core.autocrlf=true turns it into CRLF and
+# api::tests::the_reference_document_matches_the_method_table fails.
+docs/api.md -text
