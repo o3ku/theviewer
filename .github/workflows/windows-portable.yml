@@ -1,0 +1,153 @@
+name: Windows portable
+
+# Builds theviewer from source on Windows and publishes a portable zip.
+# Runs on a tag push (v*-portable*) or by hand from the Actions tab.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create or update, e.g. v0.4.0-portable.1"
+        required: true
+        default: "v0.4.0-portable.1"
+  push:
+    tags:
+      - "v*-portable*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-portable-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and publish portable zip
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Show toolchain
+        run: |
+          rustc -vV
+          cargo --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-portable
+
+      - name: Build
+        run: cargo build --release --locked
+
+      # A release build is a windows_subsystem app, so it has no console of its
+      # own; hand it a redirected stdout and check the exit code instead.
+      - name: Smoke test (headless)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = 'target/release/theviewer.exe'
+          $p = Start-Process -FilePath $exe -ArgumentList 'api','--describe' `
+            -RedirectStandardOutput 'dist-smoke.json' -RedirectStandardError 'dist-smoke.err' `
+            -Wait -PassThru
+          $bytes = if (Test-Path 'dist-smoke.json') { (Get-Item 'dist-smoke.json').Length } else { 0 }
+          "theviewer.exe size = {0:N1} MB, api --describe exit = {1}, stdout = {2} bytes" -f `
+            ((Get-Item $exe).Length / 1MB), $p.ExitCode, $bytes
+          if ($p.ExitCode -ne 0) {
+            Get-Content 'dist-smoke.err' -ErrorAction SilentlyContinue
+            throw "theviewer.exe api --describe failed with exit code $($p.ExitCode)"
+          }
+          if ($bytes -lt 1000) { throw "api --describe wrote only $bytes bytes to stdout" }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
+          $name = "theviewer-$version-windows-x86_64-portable"
+          $dir = "dist/$name"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item 'target/release/theviewer.exe' $dir
+          Copy-Item 'LICENSE-MIT', 'LICENSE-APACHE', 'README.md' $dir
+
+          $notes = @"
+          theviewer $version - Windows x86_64 portable build
+          =================================================
+
+          Unpack anywhere and run theviewer.exe:
+
+              theviewer.exe path\to\file.bin
+
+          Everything is built in: the signature catalogue, the reference notes,
+          the templates and the sample plugins are compiled into the executable,
+          so no other file in this folder is needed to run it.
+
+          Optional, picked up from PATH when present:
+            ffmpeg / ffprobe   video frame and audio extraction
+            tshark             packet dissection cross-check
+
+          Settings, recipes and the cached RFC text live under
+          %USERPROFILE%\.config\theviewer and %USERPROFILE%\.cache\theviewer.
+
+          This build links the Microsoft C runtime dynamically: if Windows
+          complains about a missing VCRUNTIME140.dll, install the Visual C++
+          Redistributable (x64) from https://aka.ms/vs/17/release/vc_redist.x64.exe
+
+          Built from $(git rev-parse HEAD) by GitHub Actions (windows-latest,
+          rustc stable). Upstream project: https://github.com/benjaminr/theviewer
+          Licence: MIT OR Apache-2.0.
+          "@
+          Set-Content -Path "$dir/RUN.txt" -Value $notes -Encoding utf8
+
+          $zip = "dist/$name.zip"
+          Compress-Archive -Path $dir -DestinationPath $zip -CompressionLevel Optimal
+          (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() + "  $name.zip" |
+            Set-Content -Path "$zip.sha256" -Encoding ascii
+
+          "ASSET=$zip"       | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SUM=$zip.sha256"  | Out-File -FilePath $env:GITHUB_ENV -Append
+          "NAME=$name"       | Out-File -FilePath $env:GITHUB_ENV -Append
+          Get-ChildItem dist -Recurse | Select-Object FullName, Length | Format-Table
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: |
+            ${{ env.ASSET }}
+            ${{ env.SUM }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish release
+        if: github.ref_type == 'tag' || inputs.tag != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sum = (Get-Content $env:SUM) -replace '\s+', ' '
+          $body = @"
+          Windows x86_64 portable build of theviewer, built from source in GitHub Actions.
+
+          Built from commit $(git rev-parse --short HEAD) of this fork
+          (upstream: benjaminr/theviewer). Unpack the zip and run:  theviewer.exe <file>
+          Everything else is compiled into the executable; see RUN.txt in the zip.
+
+              SHA-256  $sum
+          "@
+          Set-Content -Path 'release-notes.md' -Value $body -Encoding utf8
+          gh release view $env:TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG $env:ASSET $env:SUM --clobber --repo $env:GITHUB_REPOSITORY
+          } else {
+            gh release create $env:TAG $env:ASSET $env:SUM `
+              --repo $env:GITHUB_REPOSITORY `
+              --title "theviewer Windows portable ($env:TAG)" `
+              --notes-file 'release-notes.md'
+          }
